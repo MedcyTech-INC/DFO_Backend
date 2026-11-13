@@ -223,7 +223,7 @@ export class ClinicsUtilsService {
         const normStartTime = this.normalizeTime(startTime);
         const { data: slots } = await supabase
             .from('opdesk_sakhi_clinic_availability_slots')
-            .select('id, booked_count, start_time, end_time')
+            .select('id, capacity, booked_count, start_time, end_time')
             .eq('doctor_id', doctorId)
             .eq('slot_date', date);
             
@@ -234,9 +234,15 @@ export class ClinicsUtilsService {
         });
 
         if (matchingSlot) {
+            const newCount = (matchingSlot.booked_count || 0) + 1;
+            const capacity = matchingSlot.capacity || 1;
             await supabase
                 .from('opdesk_sakhi_clinic_availability_slots')
-                .update({ booked_count: (matchingSlot.booked_count || 0) + 1 })
+                .update({ 
+                    booked_count: newCount,
+                    status: newCount >= capacity ? 'BOOKED' : 'AVAILABLE',
+                    updated_at: new Date().toISOString()
+                })
                 .eq('id', matchingSlot.id);
         }
     }
@@ -245,7 +251,7 @@ export class ClinicsUtilsService {
         const normStartTime = this.normalizeTime(startTime);
         const { data: slots } = await supabase
             .from('opdesk_sakhi_clinic_availability_slots')
-            .select('id, booked_count, start_time, end_time')
+            .select('id, capacity, booked_count, start_time, end_time')
             .eq('doctor_id', doctorId)
             .eq('slot_date', date);
             
@@ -256,9 +262,14 @@ export class ClinicsUtilsService {
         });
 
         if (matchingSlot && matchingSlot.booked_count > 0) {
+            const newCount = Math.max(0, matchingSlot.booked_count - 1);
             await supabase
                 .from('opdesk_sakhi_clinic_availability_slots')
-                .update({ booked_count: matchingSlot.booked_count - 1 })
+                .update({ 
+                    booked_count: newCount,
+                    status: 'AVAILABLE',
+                    updated_at: new Date().toISOString()
+                })
                 .eq('id', matchingSlot.id);
         }
     }

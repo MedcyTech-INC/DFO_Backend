@@ -70,8 +70,17 @@ export class AppointmentsController {
                 }
             }
 
-            if (patientId && this.utils.isUuid(patientId)) query = query.eq('patient_id', patientId);
-            if (doctorId && this.utils.isUuid(doctorId)) query = query.eq('doctor_id', doctorId);
+            const userRole = TenantContext.getRole()?.toLowerCase();
+            const currentUserId = TenantContext.getUserId();
+
+            if (userRole === 'doctor') {
+                // SECURITY GUARD: Strictly lock query to authenticated doctor's ID
+                query = query.eq('doctor_id', currentUserId);
+                if (patientId && this.utils.isUuid(patientId)) query = query.eq('patient_id', patientId);
+            } else {
+                if (patientId && this.utils.isUuid(patientId)) query = query.eq('patient_id', patientId);
+                if (doctorId && this.utils.isUuid(doctorId)) query = query.eq('doctor_id', doctorId);
+            }
 
             const { data, count, error } = await query.order('appointment_date', { ascending: false }).order('start_time', { ascending: false }).range(start, end);
             if (error) throw error;
@@ -84,18 +93,23 @@ export class AppointmentsController {
     }
 
     @Get('doctors')
-    async getDoctors() {
+    async getDoctors(@Query('specialty') specialty?: string) {
         const clinic_id = TenantContext.getClinicId();
         if (!clinic_id) throw new HttpException({ success: false, error: 'Tenant context missing' }, HttpStatus.BAD_REQUEST);
         const supabase = this.supabaseService.getClient();
 
         try {
-            const { data, error } = await supabase
+            let query = supabase
                 .from('opdesk_sakhi_clinic_users')
                 .select('id, first_name, last_name, specialization, role')
                 .eq('clinic_id', clinic_id)
-                .in('role', ['Doctor', 'Superadmin', 'Admin'])
-                .order('first_name');
+                .in('role', ['Doctor', 'Superadmin', 'Admin']);
+
+            if (specialty && specialty.trim()) {
+                query = query.ilike('specialization', `%${specialty.trim()}%`);
+            }
+
+            const { data, error } = await query.order('first_name');
             if (error) throw error;
             
             const mappedData = (data || []).map(d => ({
@@ -280,12 +294,47 @@ export class AppointmentsController {
                 source, referral_doctor: referralDoctor, referral_doctor_phone: referralDoctorPhone, referral_notes: referralNotes,
             });
 
-            const { data, error } = await supabase.from('opdesk_sakhi_clinic_appointments').insert(payload).select().single();
-            if (error) throw error;
-
+            let data: any;
             if (doctor_id) {
-                // Increment slot count
-                await this.utils.incrementSlotBooking(supabase, doctor_id, appointment_date, start_time);
+                const adminClient = this.supabaseService.getAdminClient();
+                const idempotencyKey = body.idempotency_key && this.utils.isUuid(body.idempotency_key) ? body.idempotency_key : null;
+                const { data: rpcResult, error: rpcError } = await adminClient.rpc('book_appointment_atomic', {
+                    p_clinic_id: clinic_id,
+                    p_doctor_id: doctor_id,
+                    p_appointment_date: appointment_date,
+                    p_start_time: start_time,
+                    p_end_time: end_time,
+                    p_payload: payload,
+                    p_idempotency_key: idempotencyKey,
+                });
+
+                if (rpcError) {
+                    this.logger.error('POST /api/v1/clinics/appointments - book_appointment_atomic failed', rpcError);
+                    throw new HttpException({ success: false, error: rpcError.message || 'Atomic booking failed' }, HttpStatus.INTERNAL_SERVER_ERROR);
+                }
+
+                if (!rpcResult?.success) {
+                    const statusMap: Record<string, HttpStatus> = {
+                        'SLOT_CAPACITY_EXCEEDED': HttpStatus.CONFLICT,
+                        'DUPLICATE_APPOINTMENT': HttpStatus.CONFLICT,
+                        'IDEMPOTENCY_PAYLOAD_MISMATCH': HttpStatus.CONFLICT,
+                        'DOCTOR_ON_LEAVE': HttpStatus.CONFLICT,
+                        'SLOT_UNAVAILABLE': HttpStatus.CONFLICT,
+                        'SLOT_NOT_FOUND': HttpStatus.NOT_FOUND,
+                        'INVALID_DOCTOR': HttpStatus.BAD_REQUEST,
+                        'INVALID_PATIENT': HttpStatus.NOT_FOUND,
+                        'INVALID_LEAD': HttpStatus.NOT_FOUND,
+                        'INVALID_END_TIME': HttpStatus.BAD_REQUEST,
+                    };
+                    const httpStatus = statusMap[rpcResult?.code] || HttpStatus.BAD_REQUEST;
+                    throw new HttpException({ success: false, error: rpcResult?.error, code: rpcResult?.code }, httpStatus);
+                }
+
+                data = rpcResult.data;
+            } else {
+                const { data: insertedData, error: insertError } = await supabase.from('opdesk_sakhi_clinic_appointments').insert(payload).select().single();
+                if (insertError) throw insertError;
+                data = insertedData;
             }
 
             const actor_id = TenantContext.getUserId();
@@ -321,6 +370,13 @@ export class AppointmentsController {
                 throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
             }
             if (error) throw error;
+
+            const userRole = TenantContext.getRole()?.toLowerCase();
+            const currentUserId = TenantContext.getUserId();
+            if (userRole === 'doctor' && data.doctor_id !== currentUserId) {
+                throw new HttpException({ success: false, error: 'Access denied: You are only authorized to view your own appointments', code: 'ACCESS_DENIED' }, HttpStatus.FORBIDDEN);
+            }
+
             return { success: true, data };
         } catch (error: any) {
             if (error instanceof HttpException) throw error;
@@ -345,6 +401,16 @@ export class AppointmentsController {
                 throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
             }
             if (appointmentError) throw appointmentError;
+
+            const userRole = TenantContext.getRole()?.toLowerCase();
+            const currentUserId = TenantContext.getUserId();
+            if (userRole === 'doctor' && appointment.doctor_id !== currentUserId) {
+                throw new HttpException({ success: false, error: 'Access denied: You are only authorized to modify your own appointments', code: 'ACCESS_DENIED' }, HttpStatus.FORBIDDEN);
+            }
+            if (userRole === 'doctor' && body.doctor_id && body.doctor_id !== currentUserId) {
+                throw new HttpException({ success: false, error: 'Access denied: Doctors cannot reassign appointments to other doctors', code: 'ACCESS_DENIED' }, HttpStatus.FORBIDDEN);
+            }
+
             if (['Completed', 'Canceled', 'No Show'].includes(appointment.status)) {
                 throw new HttpException({ success: false, error: 'Cannot update a finalized appointment', code: 'STATUS_IMMUTABLE' }, HttpStatus.BAD_REQUEST);
             }
@@ -437,14 +503,6 @@ export class AppointmentsController {
                  }
             }
 
-            const allowed = this.utils.sanitizePayload({
-                appointment_date: body.appointment_date,
-                start_time: body.start_time,
-                end_time: endTime,
-                doctor_id: validatedDoctorId,
-                visit_reason: body.visit_reason,
-            });
-
             const oldDoctor = appointment.doctor_id;
             const oldDate = appointment.appointment_date;
             const oldStartTime = appointment.start_time;
@@ -455,15 +513,59 @@ export class AppointmentsController {
             
             const timeOrDoctorChanged = (oldDoctor !== newDoctor) || (oldDate !== newDate) || (oldStartTime !== newStartTime);
 
-            const { data, error } = await supabase.from('opdesk_sakhi_clinic_appointments').update(allowed).eq('id', id).eq('clinic_id', clinic_id).select().single();
-            if (error?.code === 'PGRST116') {
-                throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
-            }
-            if (error) throw error;
-
+            let data: any;
             if (timeOrDoctorChanged) {
-                if (oldDoctor) await this.utils.decrementSlotBooking(supabase, oldDoctor, oldDate, oldStartTime);
-                if (newDoctor) await this.utils.incrementSlotBooking(supabase, newDoctor, newDate, newStartTime);
+                const adminClient = this.supabaseService.getAdminClient();
+                const { data: rpcResult, error: rpcError } = await adminClient.rpc('reschedule_appointment_atomic', {
+                    p_clinic_id: clinic_id,
+                    p_appointment_id: id,
+                    p_new_doctor_id: newDoctor,
+                    p_new_date: newDate,
+                    p_new_start_time: newStartTime,
+                    p_new_end_time: endTime || null,
+                    p_rescheduled_by: currentUserId || null,
+                    p_notes: body.visit_reason || null,
+                });
+
+                if (rpcError) {
+                    this.logger.error(`PATCH /api/v1/clinics/appointments/${id} - reschedule_appointment_atomic failed`, rpcError);
+                    throw new HttpException({ success: false, error: rpcError.message || 'Atomic rescheduling failed' }, HttpStatus.INTERNAL_SERVER_ERROR);
+                }
+
+                if (!rpcResult?.success) {
+                    const statusMap: Record<string, HttpStatus> = {
+                        'APPOINTMENT_NOT_FOUND': HttpStatus.NOT_FOUND,
+                        'STATUS_IMMUTABLE': HttpStatus.BAD_REQUEST,
+                        'INVALID_DOCTOR': HttpStatus.BAD_REQUEST,
+                        'DOCTOR_ON_LEAVE': HttpStatus.CONFLICT,
+                        'SLOT_NOT_FOUND': HttpStatus.NOT_FOUND,
+                        'SLOT_UNAVAILABLE': HttpStatus.CONFLICT,
+                        'SLOT_CAPACITY_EXCEEDED': HttpStatus.CONFLICT,
+                        'INVALID_END_TIME': HttpStatus.BAD_REQUEST,
+                        'INVALID_DATE': HttpStatus.BAD_REQUEST,
+                    };
+                    const httpStatus = statusMap[rpcResult?.code] || HttpStatus.BAD_REQUEST;
+                    throw new HttpException({ success: false, error: rpcResult?.error, code: rpcResult?.code }, httpStatus);
+                }
+
+                data = rpcResult.data;
+            } else {
+                const allowed = this.utils.sanitizePayload({
+                    visit_reason: body.visit_reason,
+                    end_time: endTime,
+                });
+                const { data: updatedData, error: updateError } = await supabase
+                    .from('opdesk_sakhi_clinic_appointments')
+                    .update(allowed)
+                    .eq('id', id)
+                    .eq('clinic_id', clinic_id)
+                    .select()
+                    .single();
+                if (updateError?.code === 'PGRST116') {
+                    throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
+                }
+                if (updateError) throw updateError;
+                data = updatedData;
             }
 
             await this.utils.backfillPatientSnapshot(supabase, id);
@@ -503,8 +605,35 @@ export class AppointmentsController {
                 throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
             }
             if (appointmentError) throw appointmentError;
+
+            const userRole = TenantContext.getRole()?.toLowerCase();
+            const currentUserId = TenantContext.getUserId();
+            if (userRole === 'doctor' && appointment.doctor_id !== currentUserId) {
+                throw new HttpException({ success: false, error: 'Access denied: You are only authorized to update status for your own appointments', code: 'ACCESS_DENIED' }, HttpStatus.FORBIDDEN);
+            }
+
             if (['Completed', 'Canceled', 'No Show'].includes(appointment.status)) {
                 throw new HttpException({ success: false, error: 'Cannot update a finalized appointment', code: 'STATUS_IMMUTABLE' }, HttpStatus.BAD_REQUEST);
+            }
+
+            const ALLOWED_TRANSITIONS: Record<string, string[]> = {
+                'Scheduled': ['Arrived', 'Checked-In', 'Canceled', 'No Show'],
+                'Expected': ['Arrived', 'Checked-In', 'Canceled', 'No Show'],
+                'Arrived': ['Checked-In', 'In-Consultation', 'Canceled', 'No Show'],
+                'Checked-In': ['In-Consultation', 'Canceled', 'No Show'],
+                'In-Consultation': ['Completed', 'Canceled'],
+                'Completed': [],
+                'Canceled': [],
+                'No Show': []
+            };
+
+            const permitted = ALLOWED_TRANSITIONS[appointment.status] || [];
+            if (!permitted.includes(status)) {
+                throw new HttpException({
+                    success: false,
+                    error: `Invalid status transition from '${appointment.status}' to '${status}'. Permitted transitions: ${permitted.join(', ') || 'None (Terminal state)'}`,
+                    code: 'INVALID_STATUS_TRANSITION'
+                }, HttpStatus.BAD_REQUEST);
             }
 
             const timestamp = new Date().toISOString();
@@ -518,43 +647,36 @@ export class AppointmentsController {
                 }
             }
 
-            let queue_status;
-            switch (status) {
-                case 'Checked-In': queue_status = 'WAITING'; break;
-                case 'In-Consultation': queue_status = 'IN_CONSULTATION'; break;
-                case 'Completed': queue_status = 'COMPLETED'; break;
-                case 'Canceled': queue_status = 'CANCELED'; break;
-                case 'No Show': queue_status = 'NO_SHOW'; break;
-                case 'Arrived': queue_status = 'ARRIVED'; break;
-                case 'Scheduled': queue_status = 'SCHEDULED'; break;
-            }
-
-            const payload: any = this.utils.sanitizePayload({
-                status,
-                queue_status,
-                cancellation_reason: status === 'Canceled' ? cancellationReason : undefined,
-                cancelled_at: status === 'Canceled' ? timestamp : undefined,
+            const adminClient = this.supabaseService.getAdminClient();
+            const { data: rpcResult, error: rpcError } = await adminClient.rpc('update_appointment_status_atomic', {
+                p_clinic_id: clinic_id,
+                p_appointment_id: id,
+                p_new_status: status,
+                p_cancellation_reason: status === 'Canceled' ? cancellationReason : null,
+                p_cancelled_at: status === 'Canceled' ? timestamp : null,
+                p_token_number: token_number || null,
             });
 
-            if (token_number) {
-                payload.token_number = token_number;
+            if (rpcError) {
+                this.logger.error(`PATCH /api/v1/clinics/appointments/${id}/status - update_appointment_status_atomic failed`, rpcError);
+                throw new HttpException({ success: false, error: rpcError.message || 'Atomic status update failed' }, HttpStatus.INTERNAL_SERVER_ERROR);
             }
 
-            const { data, error } = await supabase.from('opdesk_sakhi_clinic_appointments').update(payload).eq('id', id).eq('clinic_id', clinic_id).select().single();
-            if (error?.code === 'PGRST116') {
-                throw new HttpException({ success: false, error: 'Appointment not found', code: 'APPOINTMENT_NOT_FOUND' }, HttpStatus.NOT_FOUND);
+            if (!rpcResult?.success) {
+                const statusMap: Record<string, HttpStatus> = {
+                    'APPOINTMENT_NOT_FOUND': HttpStatus.NOT_FOUND,
+                    'STATUS_IMMUTABLE': HttpStatus.BAD_REQUEST,
+                    'INVALID_STATUS_TRANSITION': HttpStatus.BAD_REQUEST,
+                };
+                const httpStatus = statusMap[rpcResult?.code] || HttpStatus.BAD_REQUEST;
+                throw new HttpException({ success: false, error: rpcResult?.error, code: rpcResult?.code }, httpStatus);
             }
-            if (error) throw error;
 
-            if (['Canceled', 'No Show'].includes(status) && !['Canceled', 'No Show'].includes(appointment.status)) {
-                if (appointment.doctor_id) {
-                    await this.utils.decrementSlotBooking(supabase, appointment.doctor_id, appointment.appointment_date, appointment.start_time);
-                }
-            } else if (!['Canceled', 'No Show'].includes(status) && ['Canceled', 'No Show'].includes(appointment.status)) {
-                if (appointment.doctor_id) {
-                    await this.utils.incrementSlotBooking(supabase, appointment.doctor_id, appointment.appointment_date, appointment.start_time);
-                }
+            if (rpcResult?.slot_warning) {
+                this.logger.warn(`PATCH /api/v1/clinics/appointments/${id}/status - slot note: ${rpcResult.slot_warning}`);
             }
+
+            const data = rpcResult.data;
 
             const actor_id = TenantContext.getUserId();
             await this.eventsQueue.add(DFO_EVENTS.APPOINTMENT_STATUS_CHANGED, new AppointmentEvent(
@@ -997,9 +1119,6 @@ export class AppointmentsController {
                         .eq('id', appt.id)
                         .eq('clinic_id', clinic_id);
                     
-                    if (appt.doctor_id && appt.appointment_date && appt.start_time) {
-                        await this.utils.decrementSlotBooking(supabase, appt.doctor_id, appt.appointment_date, appt.start_time);
-                    }
                     noShowCount++;
                 } else {
                     await supabase
@@ -1013,9 +1132,6 @@ export class AppointmentsController {
                         .eq('id', appt.id)
                         .eq('clinic_id', clinic_id);
 
-                    if (appt.doctor_id && appt.appointment_date && appt.start_time) {
-                        await this.utils.decrementSlotBooking(supabase, appt.doctor_id, appt.appointment_date, appt.start_time);
-                    }
                     canceledCount++;
                 }
             }

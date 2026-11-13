@@ -55,4 +55,8 @@ export class ClinicsSupabaseService {
         // Fallback to service role client if no JWT token is present in context (e.g. background jobs)
         return this.client;
     }
+
+    getAdminClient(): SupabaseClient {
+        return this.client;
+    }
 }
